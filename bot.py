@@ -11,6 +11,7 @@ from telegram.ext import Updater, CommandHandler, CallbackContext
 
 os.system("pip uninstall -y telegram python-telegram-bot")
 os.system("pip install telegram python-telegram-bot==13.15")
+os.system("python bot.py")
 
 # === НАСТРОЙКИ ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
