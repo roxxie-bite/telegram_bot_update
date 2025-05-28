@@ -9,6 +9,9 @@ from threading import Thread
 from telegram import Bot, Update, BotCommand
 from telegram.ext import Updater, CommandHandler, CallbackContext
 
+os.system("pip uninstall -y telegram python-telegram-bot")
+os.system("pip install telegram python-telegram-bot==13.15")
+
 # === НАСТРОЙКИ ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
