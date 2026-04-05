@@ -1,194 +1,142 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import re
 import os
-import json
+import asyncio
+import logging
 import requests
-import time
-from datetime import datetime
 from bs4 import BeautifulSoup
-from flask import Flask
-from threading import Thread
-from telegram import Bot, Update, BotCommand
-from telegram.ext import Updater, CommandHandler, CallbackContext
+from aiogram import Bot, Dispatcher
+from aiogram.filters import Command
+from aiogram.types import Message
+from aiohttp import web
+
+# ================= НАСТРОЙКИ (берутся из переменных окружения) =================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+CHAT_ID = int(os.getenv("CHAT_ID", "0"))
+TARGET_URL = "https://lynther.sytes.net/?p=lora&q=Loonie"
+MIN_INACTIVE_DAYS = 25
+CHECK_INTERVAL_HOURS = 6
+# ==============================================================================
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+if not BOT_TOKEN or CHAT_ID == 0:
+    raise ValueError("❌ Не заданы BOT_TOKEN или CHAT_ID в переменных окружения Render!")
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
 
 
-# === НАСТРОЙКИ ===
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-OWNER_ID = os.getenv("OWNER_ID")
-INTERVAL_FILE = "interval.txt"
-LAST_CHECK_FILE = "last_check.json"
-SOURCES_FILE = "sources.json"
-
-# === KEEP-ALIVE ===
-app = Flask("")
-
-
-@app.route("/")
-def home():
-    return "Бот работает!"
-
-
-def run():
-    app.run(host="0.0.0.0", port=8080)
-
-
-def keep_alive():
-    Thread(target=run).start()
-
-
-# === УТИЛИТЫ ===
-def get_interval_minutes():
+def find_inactive_loonies(url: str, min_days: int = 25) -> list:
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     try:
-        with open(INTERVAL_FILE, 'r') as f:
-            return int(f.read().strip())
-    except:
-        return 15
-
-
-def load_sources():
-    with open(SOURCES_FILE, 'r', encoding='utf-8') as f:
-        return json.load(f)
-
-
-def load_last_check():
-    if os.path.exists(LAST_CHECK_FILE):
-        with open(LAST_CHECK_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {}
-
-
-def save_last_check(data):
-    with open(LAST_CHECK_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-# === ПРОВЕРКА ИСТОЧНИКОВ ===
-def check_all_sources(bot: Bot = None) -> list:
-    last_data = load_last_check()
-    sources = load_sources()
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
+    except requests.RequestException as e:
+        logger.error(f"❌ Ошибка запроса: {e}")
+        return []
+    
+    soup = BeautifulSoup(response.text, 'html.parser')
     results = []
-
-    for source in sources:
-        original_name = source.get("name")  # имя из sources.json, ключ для last_check
-        url = source.get("url")
-        parsed_name = original_name  # пока совпадает
-
-        try:
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'html.parser')
-
-            # Парсим дату обновления
-            tag = soup.find('div', class_='updatedAtDate')
-            current_update_line = tag.text.strip() if tag else None
-
-            # Парсим настоящее название из <div class="flx Fonkartochka"><h1>...</h1>
-            name_block = soup.find('div', class_='flx Fonkartochka')
-            h1 = name_block.find('h1') if name_block else None
-            parsed_name = h1.text.strip() if h1 else original_name
-
-        except Exception as e:
-            error_msg = f"❌ [{original_name}] Ошибка:\n{str(e)}\n{url}"
-            print(error_msg)
-            if bot:
-                bot.send_message(chat_id=CHAT_ID, text=error_msg)
+    lines = soup.get_text().split('\n')
+    
+    id_pattern = re.compile(r'#️⃣\s*(\d+)')
+    days_pattern = re.compile(r'🕸️\s*(\d+)\s*days?')
+    loonie_pattern = re.compile(r'\bLoonie\b', re.IGNORECASE)
+    
+    current = {}
+    for line in lines:        line = line.strip()
+        if not line: continue
+            
+        id_match = id_pattern.search(line)
+        if id_match:
+            if current.get('id') and current.get('days') is not None and current.get('has_loonie'):
+                if current['days'] > min_days:
+                    results.append({'id': current['id'], 'days': current['days'], 'name': current.get('name', 'Loonie')})
+            current = {'id': id_match.group(1), 'days': None, 'has_loonie': bool(loonie_pattern.search(line)), 'name': 'Loonie'}
             continue
-
-        if not current_update_line:
-            msg = f"⚠️ [{parsed_name}] Не найдена дата обновления:\n{url}"
-            print(msg)
-            if bot:
-                bot.send_message(chat_id=CHAT_ID, text=msg)
-            continue
-
-        saved_line = last_data.get(original_name)
-
-        if saved_line != current_update_line:
-            print(f"[{parsed_name}] Обновление найдено.")
-            message = (f"🔔 Обновление: *{parsed_name}*\n"
-                       f"`{current_update_line}`\n"
-                       f"[Перейти на страницу]({url})")
-            if bot:
-                bot.send_message(chat_id=CHAT_ID,
-                                 text=message,
-                                 parse_mode='Markdown')
-            last_data[original_name] = current_update_line
-            results.append((parsed_name, True))
-        else:
-            print(f"[{parsed_name}] Без изменений.")
-            results.append((parsed_name, False))
-
-    save_last_check(last_data)
+            
+        if current.get('id'):
+            days_match = days_pattern.search(line)
+            if days_match: current['days'] = int(days_match.group(1))
+            if loonie_pattern.search(line): current['has_loonie'] = True
+                
+    if current.get('id') and current.get('days') is not None and current.get('has_loonie'):
+        if current['days'] > min_days:
+            results.append({'id': current['id'], 'days': current['days'], 'name': current.get('name', 'Loonie')})
     return results
 
 
-# === КОМАНДЫ ===
-def start(update: Update, context: CallbackContext):
-    update.message.reply_text(
-        "✅ Бот запущен.\n"
-        "Команды:\n"
-        "/check — проверить обновления\n"
-        "/setinterval <мин> — изменить интервал (только для владельца)")
+def format_msg(lora: dict) -> str:
+    return (f"🧠 <b>{lora['name']}</b>\n"
+            f"🆔 <code>ID: {lora['id']}</code>\n"
+            f"🕸️ <b>{lora['days']} дней</b> без использования\n"
+            f"🗑️ <code>/dellora {lora['id']}</code>\n"
+            f"{'─' * 30}")
 
 
-def manual_check(update: Update, context: CallbackContext):
-    update.message.reply_text("🔍 Проверяю все источники...")
-    results = check_all_sources(context.bot)
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    await message.answer("👋 Привет! Бот запущен. Используй /check для ручной проверки.")
 
-    updated = [name for name, changed in results if changed]
-    if updated:
-        update.message.reply_text(
-            f"✅ Обновления найдены: {', '.join(updated)}")
-    elif results:
-        update.message.reply_text("ℹ️ Обновлений не найдено.")
-    else:
-        update.message.reply_text("⚠️ Не удалось проверить источники.")
-
-
-def set_interval(update: Update, context: CallbackContext):
-    user_id = str(update.effective_user.id)
-    if user_id != OWNER_ID:
-        update.message.reply_text("🚫 У тебя нет прав изменять интервал.")
+@dp.message(Command("check"))
+async def cmd_check(message: Message):
+    await message.answer("🔍 Сканирую...")
+    loras = find_inactive_loonies(TARGET_URL, MIN_INACTIVE_DAYS)
+    if not loras:
+        await message.answer("✅ Лоры не найдены.")
         return
+    for l in loras:
+        await message.answer(format_msg(l), parse_mode="HTML")
+        await asyncio.sleep(0.3)
 
-    try:
-        minutes = int(context.args[0])
-        if minutes < 1 or minutes > 1440:
-            raise ValueError
-        with open(INTERVAL_FILE, 'w') as f:
-            f.write(str(minutes))
-        update.message.reply_text(
-            f"✅ Интервал проверки установлен: {minutes} минут.")
-    except:
-        update.message.reply_text("⚠️ Использование: /setinterval <минут>")
+@dp.message(Command("status"))
+async def cmd_status(message: Message):
+    await message.answer(f"⚙️ Работает. Порог: {MIN_INACTIVE_DAYS} дней. Автопроверка каждые {CHECK_INTERVAL_HOURS} ч.")
 
-
-# === АВТО-ПРОВЕРКА ===
-def auto_check(bot: Bot):
+async def periodic_check():
+    await asyncio.sleep(60)
     while True:
-        check_all_sources(bot)
-        time.sleep(get_interval_minutes() * 60)
+        try:
+            loras = find_inactive_loonies(TARGET_URL, MIN_INACTIVE_DAYS)
+            if loras:
+                for l in loras:
+                    await bot.send_message(chat_id=CHAT_ID, text=format_msg(l), parse_mode="HTML")
+                    await asyncio.sleep(0.3)
+        except Exception as e:
+            logger.error(f"Ошибка проверки: {e}")
+        await asyncio.sleep(CHECK_INTERVAL_HOURS * 3600)
 
 
-# === ЗАПУСК ===
-def main():
-    keep_alive()
-    updater = Updater(BOT_TOKEN)
-    dp = updater.dispatcher
+async def on_startup():
+    logger.info("🚀 Бот запущен!")
+    asyncio.create_task(periodic_check())
 
-    updater.bot.set_my_commands([
-        BotCommand("start", "Старт и справка"),
-        BotCommand("check", "Проверить обновления"),
-        BotCommand("setinterval", "Изменить интервал (только для владельца)")
-    ])
 
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("check", manual_check))
-    dp.add_handler(CommandHandler("setinterval", set_interval))
+# 🌐 HTTP-сервер для Render (обязательно на бесплатном тарифе)
+async def health_handler(request):
+    return web.Response(text="OK")
 
-    Thread(target=auto_check, args=(updater.bot, ), daemon=True).start()
-    updater.start_polling()
-    updater.idle()
+async def run_web_server():
+    app = web.Application()
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/health", health_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "8080")))
+    await site.start()
+    logger.info(f"🌐 Health server on port {os.getenv('PORT', '8080')}")
 
+
+async def main():
+    dp.startup.register(on_startup)
+    # Запускаем бота и веб-сервер параллельно
+    await asyncio.gather(dp.start_polling(bot), run_web_server())
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("👋 Бот остановлен.")
